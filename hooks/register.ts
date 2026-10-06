@@ -12,6 +12,7 @@ const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
+const HANDOFF_COMMAND = 'handoff'
 
 // $ per million tokens, [cache read, 1h cache write, output], list prices September 2026.
 // Longer family names first: a model id matches the first row it contains.
@@ -44,6 +45,7 @@ export type State = {
   coldWritePending: boolean
   misses: Miss[]
   pending: { cancel: () => void } | null
+  handoffAt: number
   last: PingRecord | null
   stopped: string | null
 }
@@ -143,8 +145,14 @@ export function seedFromResume(s: State, e: ResumeFields, now: number): string |
   return `resuming cold. The first message re-writes ${s.ctx.toLocaleString('en-US')} tokens, about ${usd}. /clear and paste a summary if you only need the conclusions.`
 }
 
+function fmtClock(ms: number): string {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
 function statusText(s: State, now: number): string | undefined {
   if (s.stopped) return `keepwarm stopped: ${s.stopped}`
+  if (s.handoffAt) return `keepwarm window ended · handoff at ${fmtClock(s.handoffAt)}`
   if (!s.deadline) return undefined
   const pingText = s.last ? ` · last ping read ${fmtTok(s.last.read)} ${fmtUsd(s.last.usd)}` : ''
   const nextText = !s.lastRequestAt ? ' · waiting for the first turn'
@@ -162,6 +170,7 @@ function updateStatus($: EngineInterface, s: State, now: number) {
 function disarm(s: State) {
   if (s.pending) s.pending.cancel()
   s.pending = null
+  s.handoffAt = 0
 }
 
 // The window and its ping period belong to the session that armed them, so a
@@ -201,10 +210,15 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
 }
 
 async function arm($: EngineInterface, s: State) {
+  // A turn or compaction after the window ended cancels its pending handoff, and the row with it.
+  const handingOff = s.handoffAt > 0
   disarm(s)
-  if (!s.deadline) return
+  if (!s.deadline) {
+    if (handingOff) updateStatus($, s, await $.clock.now())
+    return
+  }
   const now = await $.clock.now()
-  if (now >= s.deadline) return stop($, s, null)
+  if (now >= s.deadline) return endWindow($, s, now)
   // A cold window still needs expiry cleanup, but must not send a model request.
   if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
     const untilCold = s.lastRequestAt + TTL_MS - now
@@ -249,6 +263,36 @@ async function ping($: EngineInterface, s: State) {
   await arm($, s)
 }
 
+async function hasHandoff($: EngineInterface): Promise<boolean> {
+  return (await $.command.list()).some(c => c.name === HANDOFF_COMMAND)
+}
+
+/** A window that ends on a warm cache runs /handoff at the slot its next ping would have taken, while the cache can still be read; otherwise it just stops. */
+async function endWindow($: EngineInterface, s: State, now: number) {
+  const from = s.lastRequestAt
+  const at = from + s.every
+  const warm = from > 0 && !s.compacted && !isCold(s, now) && at < from + TTL_MS
+  await stop($, s, null)
+  if (!warm || !(await hasHandoff($))) return
+  s.handoffAt = at
+  s.pending = $.clock.after(Math.max(1000, at - now), () => { void handoff($, s, from) })
+  updateStatus($, s, now)
+}
+
+async function handoff($: EngineInterface, s: State, from: number) {
+  s.pending = null
+  s.handoffAt = 0
+  const now = await $.clock.now()
+  updateStatus($, s, now)
+  // A request since the window ended means the person is back, or the cache is no longer cheap to read.
+  if (s.lastRequestAt !== from || s.compacted || isCold(s, now) || !(await hasHandoff($))) return
+  try {
+    await $.command.run({ command: HANDOFF_COMMAND })
+  } catch (err) {
+    $.ui.log(`the handoff did not run, ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 /** The reply to an arming command; on a cold cache it says when the first ping can come. */
 function armedText(s: State, now: number, windowMs: number): string {
   if (isCold(s, now)) return `keepwarm on for ${fmtDuration(windowMs)}. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn`
@@ -277,7 +321,7 @@ function card(s: State, now: number): string {
   lines.push(`cold cost   ${fmtUsd(coldUsd(s))} to re-write it (warm turn ${fmtUsd(warmUsd(s))})`)
   const always = s.always ? ' (always)' : ''
   const idle = s.always ? 'off until the next session start, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
-  lines.push(`keepwarm    ${s.deadline ? (statusText(s, now) ?? '').replace(/^keepwarm /, 'on, ') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
+  lines.push(`keepwarm    ${s.deadline || s.handoffAt ? (statusText(s, now) ?? '').replace(/^keepwarm /, s.deadline ? 'on, ' : '') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
   const pings = breakEvenPings(s)
   if (pings != null) lines.push(`break-even  up to ${pings} pings at the read rate cost one cold write, about ${fmtDuration(pings * s.every)} of idle at one ping per ${fmtDuration(s.every)}`)
   lines.push(`guard       ${s.guard === 'refuse' ? 'refuse once (/cache-tax guard warn to only show the price)' : 'warn only (/cache-tax guard refuse to be stopped once)'}`)
@@ -289,7 +333,7 @@ function card(s: State, now: number): string {
 export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
-    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, handoffAt: 0, last: null, stopped: null,
   }
 }
 

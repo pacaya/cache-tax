@@ -42,6 +42,8 @@ A detected cold write automatically arms at least three hours of keepwarm. `/cac
 
 Windows belong to individual sessions. An already-cold session waits for your next turn before pinging. A window ends at its deadline; `/keepwarm off` also cancels it and clears the always setting.
 
+**When a window ends warm:** if a slash command named exactly `handoff` exists, the mod waits for the slot the next ping would have taken and runs `/handoff` instead, while the cache can still be read. The row above the prompt shows `window ended · handoff at HH:MM` until then. Any turn, `/keepwarm off` or a new window cancels it. A cold or just-compacted cache gets no handoff, and without the command the window ends as before.
+
 ### A recorded warming ping
 
 ![Real keepwarm status showing a 75k-token cache read at $0.02](site/assets/keepwarm-receipt.png)
@@ -91,15 +93,15 @@ The hook and the mod share a name and a job, so having both means two guards on 
 Validated on Claude Code 2.1.289:
 
     ❯ ./register.ts hooks: config.set{key=theme}, ui.render{component=AbovePrompt}, session.start, classic.SessionStart, command.run{command=keepwarm}, command.run{command=cache-tax}, prompt.submit, turn.step, turn.complete, session.compact
-    ❯ ./register.ts calls: $.clock.after (via arm), $.clock.now, $.command.list, $.command.register, $.config.list, $.env.get, $.model.fork (via ping), $.session.id, $.session.model, $.session.usage, $.store.delete (via prune, startWindow, stop), $.store.get, $.store.set, $.ui.invalidate, $.ui.log, $.ui.resolve, $.ui.status
+    ❯ ./register.ts calls: $.clock.after (via arm, endWindow), $.clock.now, $.command.list, $.command.register, $.command.run (via handoff), $.config.list, $.env.get, $.model.fork (via ping), $.session.id, $.session.model, $.session.usage, $.store.delete (via prune, startWindow, stop), $.store.get, $.store.set, $.ui.invalidate, $.ui.log, $.ui.resolve, $.ui.status
     ❯ ./register.ts env reads: NO_COLOR
 
 Reach L2, drives Claude. Sees every prompt you type, every model request's timing and every answer's token counts.
 
     Threat model for cache-tax (reach L2, drives Claude)
     1. Reads:    of each prompt, whether it starts with a slash and nothing else (the text is passed on untouched, never kept, never logged); the time; the token counts and model id the engine already holds on turn.complete and on the fork's reply; the resume fields Claude Code computes for settings hooks; the command list, the session id and, when a resumed session's fields carry no model id, the session's model once at start; from its own $.store, the keepwarm deadline and the ping period keyed by session id, plus the global always switch and guard mode
-    2. Runs:     one $.model.fork per idle stretch inside a keepwarm window, one per ping period (50 minutes unless the testing knob set it, floor 1 minute), never outside the window, never onto a cache the mod already knows is cold, never after a readback that read nothing or wrote at least a tenth of what it read
-    3. Sends:    nothing leaves the machine except the fork, an API request over the session's own transcript with a fixed one-line prompt
+    2. Runs:     one $.model.fork per idle stretch inside a keepwarm window, one per ping period (50 minutes unless the testing knob set it, floor 1 minute), never outside the window, never onto a cache the mod already knows is cold, never after a readback that read nothing or wrote at least a tenth of what it read; and at most once per window, at the ping slot after a window that ended on a warm cache, the slash command named exactly `handoff` with no arguments, if one is listed, as a full main-session turn with whatever tools that skill allows, unattended
+    3. Sends:    nothing leaves the machine except the fork, an API request over the session's own transcript with a fixed one-line prompt, and the `/handoff` turn, whose requests and tool calls are the skill's own
     4. Persists: in $.store, the keepwarm deadline and the ping period under this session's id, and the always switch and the guard mode for every session; a window that has ended is deleted at stop and at this session's next start, together with the bare keys of a 2.1.0 store; another session's keys are never deleted here, because a read followed by a delete cannot be made atomic against that session renewing its window, so a session that armed keepwarm and never came back leaves two small keys behind; the session's cold-write tally lives in memory and dies with the session
     5. Hostile input: the only text it parses is the argument of its two commands, matched against a duration regex and five literals; of the prompt text only the first non-blank character is inspected, for a slash; tool results and files never reach a branch; the fork's prompt is a constant, so nothing crafted can be sent through it; a refusal only ever drops the user's own message, and the resend is unconditional; if a hook throws, the engine skips it and the message enters unguarded, with one dim line
 
