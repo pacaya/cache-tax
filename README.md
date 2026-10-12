@@ -7,7 +7,7 @@
 
 **Keep Claude Code's prompt cache warm during breaks.**
 
-Cache Tax is a Claude Code mod that refreshes your prompt cache while you step away and shows the estimated rewrite cost before a cold send. Run `/keepwarm 90m` before a break. Pings cost tokens; choose a window you expect to return within.
+Cache Tax is a Claude Code mod that refreshes your prompt cache while you step away and shows the estimated rewrite cost before a cold send. Run `/keepwarm 90m` before a break. The window counts from your last interaction, so `90m` means 90 minutes after you stop typing. Pings cost tokens; choose a span you expect to return within.
 
 **[Install](#install)** · [Website](https://cachetax.aidojo.si/) · [How it works](#how-it-works) · [Costs and limits](#cost-and-the-plan-limit-question) · [Commands](#commands)
 
@@ -26,7 +26,7 @@ claude plugin install cache-tax@claude-code-mods
 
 Restart Claude Code or run `/reload-plugins` in an open session. No early-access flag is needed. If you set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` previously, remove it; current Claude Code ignores it.
 
-In a warm session, run `/keepwarm` to arm six hours. Use `/keepwarm 90m` for a shorter window, or `/keepwarm off` to stop.
+In a warm session, run `/keepwarm` to keep the cache warm until six hours after your last interaction. Use `/keepwarm 90m` for a shorter window, or `/keepwarm off` to stop.
 
 **Check the main cache lifetime.** Included subscription usage defaults to one hour. API-key, usage-credit and cloud-provider sessions default to five minutes, so set [`promptCacheTtl`](https://code.claude.com/docs/en/prompt-caching#choose-the-ttl-yourself) to `"1h"` for those billing paths. A 50-minute timer cannot protect a five-minute main cache. See [Limits](#limits) for the fork evidence.
 
@@ -34,13 +34,13 @@ In a warm session, run `/keepwarm` to arm six hours. Use `/keepwarm 90m` for a s
 
 ## How it works
 
-**Before a break:** `/keepwarm` arms a bounded window. After 50 idle minutes, a timer inside Claude Code sends one tool-less fork over the session's transcript. It reads usage after every ping and stops if reads are zero or writes reach 10% of reads. There is no background transcript-polling loop.
+**Before a break:** `/keepwarm` arms a window that ends one span after your last interaction. After 50 idle minutes, a timer inside Claude Code sends one tool-less fork over the session's transcript. It reads usage after every ping and stops if reads are zero or writes reach 10% of reads. There is no background transcript-polling loop.
 
 **When you return cold:** for a context of at least 50,000 tokens, the guard drops your ordinary message once when its one-hour clock says cold. It shows the estimated rewrite price. Resend to continue, or `/clear` and start from a note.
 
 A detected cold write automatically arms at least three hours of keepwarm. `/cache-tax` shows the current cache estimate, warming window and this session's cold-write tally.
 
-Windows belong to individual sessions. An already-cold session waits for your next turn before pinging. A window ends at its deadline; `/keepwarm off` also cancels it and clears the always setting.
+Windows belong to individual sessions. An already-cold session waits for your next turn before pinging. Every prompt you send, slash commands and refused sends included, and every turn that ends moves the window's end to one span later; pings do not, so the window ends one span after you stop. There is no overall ceiling: a session you keep using stays armed, and each idle stretch costs at most one span's worth of pings. An interaction that arrives after the end, as after a sleeping laptop, closes the window instead of reviving it. `/keepwarm off` also cancels it and clears the always setting.
 
 **When a window ends warm:** if a slash command named exactly `handoff` exists, the mod waits for the slot the next ping would have taken and runs `/handoff` instead, while the cache can still be read. The row above the prompt shows `window ended · handoff at HH:MM` until then. Any turn, `/keepwarm off` or a new window cancels it. A cold or just-compacted cache gets no handoff, and without the command the window ends as before.
 
@@ -60,8 +60,8 @@ New to caching? [Anthropic explains how Claude Code uses it](https://code.claude
 
 ## Commands
 
-    /keepwarm               keep warm for six hours
-    /keepwarm 90m           keep warm for a window of your own (also 2h30m, 6h)
+    /keepwarm               keep warm until six hours after your last interaction
+    /keepwarm 90m           a span of your own (also 2h30m, 6h), counted from your last interaction
     /keepwarm always        arm a six-hour window at every session start, remembered across sessions
     /keepwarm 6h every 2m   pinging every two minutes; a testing knob, floor 1m, forgotten after this window
     /keepwarm status        the warming window, next ping and last receipt
@@ -99,10 +99,10 @@ Validated on Claude Code 2.1.289:
 Reach L2, drives Claude. Sees every prompt you type, every model request's timing and every answer's token counts.
 
     Threat model for cache-tax (reach L2, drives Claude)
-    1. Reads:    of each prompt, whether it starts with a slash and nothing else (the text is passed on untouched, never kept, never logged); the time; the token counts and model id the engine already holds on turn.complete and on the fork's reply; the resume fields Claude Code computes for settings hooks; the command list, the session id and, when a resumed session's fields carry no model id, the session's model once at start; from its own $.store, the keepwarm deadline and the ping period keyed by session id, plus the global always switch and guard mode
-    2. Runs:     one $.model.fork per idle stretch inside a keepwarm window, one per ping period (50 minutes unless the testing knob set it, floor 1 minute), never outside the window, never onto a cache the mod already knows is cold, never after a readback that read nothing or wrote at least a tenth of what it read; and at most once per window, at the ping slot after a window that ended on a warm cache, the slash command named exactly `handoff` with no arguments, if one is listed, as a full main-session turn with whatever tools that skill allows, unattended
+    1. Reads:    of each prompt, whether it starts with a slash and nothing else (the text is passed on untouched, never kept, never logged); the time; the token counts and model id the engine already holds on turn.complete and on the fork's reply; the resume fields Claude Code computes for settings hooks; the command list, the session id and, when a resumed session's fields carry no model id, the session's model once at start; from its own $.store, the keepwarm deadline, its span and the ping period keyed by session id, plus the global always switch and guard mode
+    2. Runs:     one $.model.fork per ping period of each idle stretch inside a keepwarm window, which ends one span after the person's last prompt or turn (50 minutes unless the testing knob set it, floor 1 minute), never outside the window, never onto a cache the mod already knows is cold, never after a readback that read nothing or wrote at least a tenth of what it read; and at most once per window, at the ping slot after a window that ended on a warm cache, the slash command named exactly `handoff` with no arguments, if one is listed, as a full main-session turn with whatever tools that skill allows, unattended
     3. Sends:    nothing leaves the machine except the fork, an API request over the session's own transcript with a fixed one-line prompt, and the `/handoff` turn, whose requests and tool calls are the skill's own
-    4. Persists: in $.store, the keepwarm deadline and the ping period under this session's id, and the always switch and the guard mode for every session; a window that has ended is deleted at stop and at this session's next start, together with the bare keys of a 2.1.0 store; another session's keys are never deleted here, because a read followed by a delete cannot be made atomic against that session renewing its window, so a session that armed keepwarm and never came back leaves two small keys behind; the session's cold-write tally lives in memory and dies with the session
+    4. Persists: in $.store, the keepwarm deadline, rewritten at each prompt and turn, its span and the ping period under this session's id, and the always switch and the guard mode for every session; a window that has ended is deleted at stop and at this session's next start, together with the bare keys of a 2.1.0 store; another session's keys are never deleted here, because a read followed by a delete cannot be made atomic against that session renewing its window, so a session that armed keepwarm and never came back leaves up to three small keys behind; the session's cold-write tally lives in memory and dies with the session
     5. Hostile input: the only text it parses is the argument of its two commands, matched against a duration regex and five literals; of the prompt text only the first non-blank character is inspected, for a slash; tool results and files never reach a branch; the fork's prompt is a constant, so nothing crafted can be sent through it; a refusal only ever drops the user's own message, and the resend is unconditional; if a hook throws, the engine skips it and the message enters unguarded, with one dim line
 
 ## Cost and the plan-limit question
@@ -146,10 +146,10 @@ claude plugin validate .claude-plugin/plugin.json
 claude plugin test .
 ```
 
-The [56 tests](tests/register.test.ts) use a mock clock and engine. They cover:
+The [66 tests](tests/register.test.ts) use a mock clock and engine. They cover:
 
 - **Guard:** refuse once and resend, warn mode, slash commands, small contexts, resume seeding and cold-write scoring.
-- **Warming:** command defaults, always/off, idle resets, usage-based stopping, cold-window expiry and delayed timers after sleep.
+- **Warming:** command defaults, always/off, idle resets, windows that slide on each prompt and turn but not on pings, no revival after expiry, usage-based stopping, cold-window expiry and delayed timers after sleep.
 - **Session state:** isolated store keys, restored windows, legacy cleanup, clear/compaction resets and subagent isolation.
 - **Pricing and display:** model matching, output and uncached input costs, context counts, duration formatting and the read-only break-even figure.
 - **Indicator:** terminal images and desktop SVGs, theme selection, warm/cold transitions, resume, compaction, clear, expiry, surveys, other mods' content, text alternatives and `NO_COLOR` fallback.

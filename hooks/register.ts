@@ -10,6 +10,7 @@ const BIG_TOKENS = 50000
 const PING_PROMPT = 'Reply with the single word: warm'
 const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
+const KEY_SPAN = 'span'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
 const HANDOFF_COMMAND = 'handoff'
@@ -34,6 +35,8 @@ export type State = {
   hasBand: boolean
   sid: string
   deadline: number
+  span: number
+  lastActiveAt: number
   every: number
   always: boolean
   lastRequestAt: number
@@ -184,6 +187,10 @@ function everyKey(s: State): string {
   return `${KEY_EVERY}:${s.sid}`
 }
 
+function spanKey(s: State): string {
+  return `${KEY_SPAN}:${s.sid}`
+}
+
 /** Clears this session's own dead window and the bare keys a store written before 2.1.1 still holds. Other sessions' keys are never touched: a read followed by a delete cannot be made atomic against their renewal. */
 async function prune($: EngineInterface, s: State, now: number) {
   for (const key of [KEY_DEADLINE, deadlineKey(s)]) {
@@ -192,21 +199,34 @@ async function prune($: EngineInterface, s: State, now: number) {
     if (typeof deadline === 'number' && deadline > now) continue
     await $.store.delete(key)
     await $.store.delete(KEY_EVERY + key.slice(KEY_DEADLINE.length))
+    await $.store.delete(KEY_SPAN + key.slice(KEY_DEADLINE.length))
   }
 }
 
 async function stop($: EngineInterface, s: State, why: string | null, forgetAlways = false) {
   s.deadline = 0
+  s.span = 0
   s.every = PING_AFTER_MS
   s.stopped = why
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
+  await $.store.delete(spanKey(s))
   if (forgetAlways) {
     s.always = false
     await $.store.delete(KEY_ALWAYS)
   }
   updateStatus($, s, await $.clock.now())
+}
+
+/** A window ends one span after the last interaction, so each one moves its end forward. An interaction at or past the end closes the window instead: one that has expired never comes back. A window stored without a span keeps its fixed end. */
+async function touch($: EngineInterface, s: State, now: number) {
+  if (!s.deadline) return
+  if (now >= s.deadline) return stop($, s, null)
+  s.lastActiveAt = now
+  if (!s.span) return
+  s.deadline = now + s.span
+  await $.store.set(deadlineKey(s), s.deadline)
 }
 
 async function arm($: EngineInterface, s: State) {
@@ -304,8 +324,11 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
   s.every = every
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
+  s.span = windowMs
+  s.lastActiveAt = now
   s.deadline = now + windowMs
   s.stopped = null
+  await $.store.set(spanKey(s), s.span)
   await $.store.set(deadlineKey(s), s.deadline)
   await arm($, s)
 }
@@ -332,7 +355,7 @@ function card(s: State, now: number): string {
 
 export function freshState(): State {
   return {
-    hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
+    hasBand: false, sid: '', deadline: 0, span: 0, lastActiveAt: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, handoffAt: 0, last: null, stopped: null,
   }
 }
@@ -392,8 +415,11 @@ export const register: Register = on => {
     await prune($, s, now)
     const saved = await $.store.get(deadlineKey(s))
     const savedEvery = await $.store.get(everyKey(s))
+    const savedSpan = await $.store.get(spanKey(s))
     const savedGuard = await $.store.get(KEY_GUARD)
     s.deadline = typeof saved === 'number' && saved > now ? saved : 0
+    // A store written before windows slid holds no span; its window keeps the fixed end it was armed with.
+    s.span = s.deadline && typeof savedSpan === 'number' && savedSpan > 0 ? savedSpan : 0
     s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS ? savedEvery : PING_AFTER_MS
     s.guard = savedGuard === 'warn' ? 'warn' : 'refuse'
     s.always = (await $.store.get(KEY_ALWAYS)) === true
@@ -492,8 +518,14 @@ export const register: Register = on => {
   // The message that pays. Only its first character is read.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin') return next(e)
-    if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
+    // Any prompt of the person's own, a slash command or a refused send too, is an interaction.
+    // The timer goes again, since one set for the old end would fire before the next ping is due.
+    if (s.deadline) {
+      await touch($, s, now)
+      await arm($, s)
+    }
+    if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
     if (s.guard === 'warn') {
       $.ui.log(`${guardText(s, now)} Sending anyway; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
@@ -518,8 +550,8 @@ export const register: Register = on => {
     const r = await next(e)
     if (e.agentId) return r
     const now = await $.clock.now()
-    // A sleeping host may deliver this turn before the expired window's timer.
-    if (s.deadline && now >= s.deadline) await stop($, s, null)
+    // A sleeping host may deliver this turn before the expired window's timer; touch closes it then.
+    await touch($, s, now)
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
     if (now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false

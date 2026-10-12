@@ -778,7 +778,7 @@ describe('keepwarm', () => {
     const card = await $.command.run(run('cache-tax', ''))
     expect(card.text).toMatch(/keepwarm    on, 4h59m left · cold now, first ping 50m after the next turn/)
     await $.turn.complete(turn())
-    expect(w.status.at(-1)).toBe('keepwarm 4h59m left · ping in 50m')
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · ping in 50m')
     await clock.advance(49 * MIN)
     expect(w.forks.length).toBe(0)
     await clock.advance(1 * MIN)
@@ -848,6 +848,67 @@ describe('keepwarm', () => {
     expect(w.forks.length).toBe(0)
   })
 
+  test('each turn moves the end one span past it; a ping does not', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [warm, warm, warm], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '1h'))
+    expect(store.get('span:S1')).toBe(HOUR)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(store.get('deadline:S1')).toBe(START + HOUR)
+    await clock.advance(5 * MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 115 * MIN)
+    expect(w.status.at(-1)).toBe('keepwarm 1h00m left · ping in 50m · last ping read 200k $0.05')
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    await clock.advance(10 * MIN)
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.has('span:S1')).toBe(false)
+    expect(w.status.at(-1)).toBe(undefined)
+    await clock.advance(3 * HOUR)
+    expect(w.forks.length).toBe(2)
+  })
+
+  test('a slash command with no turn moves the end and keeps the next ping on time', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [warm, warm], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '1h'))
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    // The next ping is due at 100m, after the old end at 60m, so the timer stood at 60m.
+    await clock.advance(5 * MIN)
+    await $.prompt.submit(prompt('/cache-tax'))
+    expect(store.get('deadline:S1')).toBe(START + 115 * MIN)
+    await clock.advance(44 * MIN)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(1 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+
+  test('a prompt after the end, delivered before the overdue timer, does not revive the window', async ($, on) => {
+    let now = START
+    on('clock.now', () => ({ value: now }))
+    on('clock.after', () => new Promise<{ value: void }>(() => {}))
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '1h'))
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 1000 }) }))
+    now += 2 * HOUR
+    await $.prompt.submit(prompt('/cache-tax'))
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.has('span:S1')).toBe(false)
+    expect(w.status.at(-1)).toBe(undefined)
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+  })
+
   test('subagent turns do not touch the timer', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [warm])
@@ -888,6 +949,29 @@ describe('store per session', () => {
     expect(w.forks.length).toBe(1)
   })
 
+  test('a restored window with a span slides from the next turn', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['deadline:mine', START + 2 * HOUR], ['span:mine', 2 * HOUR]])
+    world(on, [], { store, sid: 'mine' })
+    await $.session.start(session)
+    await clock.advance(HOUR)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:mine')).toBe(START + 3 * HOUR)
+  })
+
+  test('a window stored before windows slid keeps its fixed end', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['deadline:mine', START + 2 * HOUR]])
+    const w = world(on, [], { store, sid: 'mine' })
+    await $.session.start(session)
+    await clock.advance(HOUR)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:mine')).toBe(START + 2 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 1h00m left · ping in 50m')
+    await clock.advance(HOUR)
+    expect(store.has('deadline:mine')).toBe(false)
+  })
+
   test('a window that lapsed less than a week ago is left for its own session', async ($, on) => {
     const now = START + 30 * 24 * HOUR
     mock.clock(on, { now })
@@ -905,9 +989,11 @@ describe('store per session', () => {
     await $.command.run(run('keepwarm', '1h every 1m'))
     expect(store.get('deadline:mine')).toBe(START + HOUR)
     expect(store.get('every:mine')).toBe(MIN)
+    expect(store.get('span:mine')).toBe(HOUR)
     await $.command.run(run('keepwarm', 'off'))
     expect(store.has('deadline:mine')).toBe(false)
     expect(store.has('every:mine')).toBe(false)
+    expect(store.has('span:mine')).toBe(false)
     expect(store.has('always')).toBe(false)
     expect(store.get('deadline:other')).toBe(START + HOUR)
     expect(store.get('every:other')).toBe(MIN)
@@ -930,7 +1016,7 @@ describe('store per session', () => {
 
   test('this session\'s own dead window is cleared on start', async ($, on) => {
     mock.clock(on, { now: START })
-    const store = new Map<string, unknown>([['deadline:mine', START - MIN], ['every:mine', MIN], ['deadline:other', START - MIN], ['every:other', MIN]])
+    const store = new Map<string, unknown>([['deadline:mine', START - MIN], ['every:mine', MIN], ['span:mine', HOUR], ['deadline:other', START - MIN], ['every:other', MIN]])
     world(on, [], { store, sid: 'mine' })
     await $.session.start(session)
     expect([...store.keys()]).toEqual(['deadline:other', 'every:other'])
