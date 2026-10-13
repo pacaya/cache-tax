@@ -456,7 +456,9 @@ export const register: Register = on => {
       s.stopped = null
       resetForClear(s)
       s.sid = await $.session.id()
-      updateStatus($, s, await $.clock.now())
+      // /clear is a session start, so always arms the new session as a launch would; the empty conversation pings only after its first turn.
+      if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      else updateStatus($, s, await $.clock.now())
       return r
     }
     const line = seedFromResume(s, e, await $.clock.now())

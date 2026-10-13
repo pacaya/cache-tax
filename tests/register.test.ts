@@ -34,7 +34,7 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string; model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
@@ -54,7 +54,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const logs: string[] = []
   const entered: string[] = []
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: opts.sid ?? 'S1' }))
+  on('session.id', () => ({ value: (typeof opts.sid === 'function' ? opts.sid() : opts.sid) ?? 'S1' }))
   on('session.model', () => ({ value: opts.model ?? 'claude-fable-5-1' }))
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: opts.live?.tokens }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -783,6 +783,50 @@ describe('keepwarm', () => {
     expect(w.forks.length).toBe(0)
     await clock.advance(1 * MIN)
     expect(w.forks.length).toBe(1)
+  })
+
+  test('the always switch arms a fresh window on /clear, under the new session id', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let sid = 'S1'
+    const w = world(on, [warm], { store, sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(30 * MIN)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.get('deadline:S2')).toBe(START + 30 * MIN + 6 * HOUR)
+    await clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('/clear re-arms a window the always switch had stopped, as a relaunch does', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    const w = world(on, [null], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/^keepwarm stopped: /)
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+  })
+
+  test('/clear ends a window armed by hand when the always switch is off', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '90m'))
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.status.at(-1)).toBe(undefined)
+    expect(store.has('deadline:S1')).toBe(false)
   })
 
   test('the always switch on a cold resume schedules no fork before a turn, and does after one', async ($, on) => {
